@@ -3,11 +3,19 @@ from typing import Tuple
 import numpy as np
 import os, rospy, yaml, dataclasses, time
 from typing import Optional
-from dt_vl53l0x import VL53L0X #ToF sensor
+from dt_robot_utils import get_robot_name
 from duckietown.dtros import DTROS, NodeType, TopicType
 from duckietown_msgs.msg import Twist2DStamped, WheelEncoderStamped
 from sensor_msgs.msg import Range
 from std_msgs.msg import Header
+SENSOR_NAME: str = "front_center"
+
+class Object:
+    def __init__(self, type, x, y):
+        self.type = type
+        self.x = x
+        self.y = y
+        self.status = "Not Picked up"
 
 class MappingNode(DTROS):
 
@@ -15,191 +23,229 @@ class MappingNode(DTROS):
         # initialize the DTROS parent class
         super(MappingNode, self).__init__(node_name=node_name, node_type=NodeType.MAPPING)
         # static parameters
-        self.wheel_radius = 0.065
-        self.duckiebot_width = 0.10
-        self.speed_factor = 0.65    # full speed is one, that is 0.65m/s !!v = m/s not needed, maybe for angular?
-        self.turn_factor = 0.5
-        self.linear_velocity_factor = 1 #self.linear_velocit#self.speed_factor / 2.0
-        self.angular_velocity_factor = self.turn_factor * self.speed_factor / self.duckiebot_width
+        self.ToF_distance=  0.2 #in meters
+
         self.vehicle_name = os.environ['VEHICLE_NAME']
         twist_topic = f"/{self.vehicle_name}/car_cmd_switch_node/cmd"
+        self._left_encoder_topic = f"/{self.vehicle_name}/left_wheel_encoder_node/tick"
+        self._right_encoder_topic = f"/{self.vehicle_name}/right_wheel_encoder_node/tick"
 	    # form the message
         self._v = 0 #m/s
         self.omega = 0 #rad/s
+        # temporary data storage
+        self._ticks_left_counter = 0
+        self._ticks_right_counter =0
+        self._ticks_left = 0
+        self._ticks_right = 0
+        self.tick_threshold = 15
+        self.time = 0
         #initialise variables
-        self.prev_v = 0
-        self.prev_omega = 0
         self.x = 0
         self.y = 0
-        self.theta = 90 #starts off driving towards y direction
-        self.prev_x =0
-        self.prev_y = 0
-        self.prev_theta = 0
-        self.last_call_back_time = rospy.get_time()  #size limitations?
-        self.last_message_time = -1.0
-        self.last_header = None
-        self.counter = 0           #used for debug
-        self.message_time = 0
+        self.Objects = 0
+        self.last_encoder_message_left = 0
+        self.last_encoder_message_right = 0
+        self.calledby = 0
+        self._turn_angle = 0
+        self.distance_traveled = 0.0
+        self.prev_distance = 0
+        self.distance_left = 0
+        self.distance_right = 0
+        self.theta = 0 #starts off driving towards y direction
 
+        self.Map_state = "Initializing"
+        self.lastrun = False
         # construct chassis control publisher
         self._chassis_publisher = rospy.Publisher(twist_topic, Twist2DStamped, queue_size=1) #message needs to be timestamped
         #self._odometry_publisher = rospy.Publisher(self.odometry_topic, TransformStamped, queue_size=1)
         #subscriber
-        self._chassis_subscriber = rospy.Subscriber(twist_topic,Twist2DStamped, self.chassis_callback)
+        #self._chassis_subscriber = rospy.Subscriber(twist_topic,Twist2DStamped, self.chassis_callback)
+        #self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Map_Callback)
+        self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left)
+        self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right)
 
-
-        #ToF sensor
-        '''
-        self._i2c_connectors = rospy.get_param("~connectors", {})
-        self._sensor_name = rospy.get_param("~sensor_name")
-        self._frequency = int(max(1, rospy.get_param("~frequency", 10)))
-        self._mode = rospy.get_param("~mode", "BETTER")
-        #self._accuracy = ToFAccuracy.from_string(self._mode)
-
-        self._sensor: Optional[VL53L0X] = self._find_sensor()
-        if not self._sensor:
-            conns: str = yaml.safe_dump(self._i2c_connectors, indent=2, sort_keys=True)
-            self.logerr(f"No VL53L0X device found. These connectors were tested:\n{conns}\n")
-            exit(1)
-        # create publisher
-        self._pub = rospy.Publisher(
-            "~range",
-            Range,
-            queue_size=1,
-            dt_topic_type=TopicType.DRIVER,
-            dt_help="The distance to the closest object detected by the sensor",
-        )
-        max_frequency = min(self._frequency, int(1.0 / self._accuracy.timing_budget))
-        if self._frequency > max_frequency:
-            self.logwarn(
-                f"Frequency of {self._frequency}Hz not supported. The selected mode "
-                f"{self._mode} has a timing budget of {self._accuracy.timing_budget}s, "
-                f"which yields a maximum frequency of {max_frequency}Hz."
-            )
-            self._frequency = max_frequency
-        self.loginfo(f"Frequency set to {self._frequency}Hz.")
-        # create timers
-        self.timer = rospy.Timer(rospy.Duration.from_sec(1.0 / max_frequency), self._timer_cb) #clashing with other publishers?
-
-    def _find_sensor(self) -> Optional[VL53L0X]:
-        for connector in self._i2c_connectors:
-            conn: str = "[bus:{bus}](0x{address:02X})".format(**connector)
-            self.loginfo(f"Trying to open device on connector {conn}")
-            sensor = VL53L0X(i2c_bus=connector["bus"], i2c_address=connector["address"])
-            try:
-                sensor.open()
-            except FileNotFoundError:
-                # i2c BUS not found
-                self.logwarn(f"No devices found on connector {conn}, the bus does NOT exist")
-                continue
-            sensor.start_ranging(self._accuracy.mode)
-            time.sleep(1)
-            if sensor.get_distance() < 0:
-                self.logwarn(f"No devices found on connector {conn}, but the bus exists")
-                continue
-            self.loginfo(f"Device found on connector {conn}")
-            return sensor
-    def _timer_cb(self, _):
-        # detect range
-        distance_mm = self._sensor.get_distance()
-        # pack observation into a message
-        msg = Range(
-            header=Header(stamp=rospy.Time.now(), frame_id=f"{self._veh}/tof/{self._sensor_name}"),
-            radiation_type=Range.INFRARED,
-            field_of_view=self._accuracy.fov,
-            min_range=self._accuracy.min_range,
-            max_range=self._accuracy.max_range,
-            range=distance_mm / 1000,
-        )
-        # publish
-        self._pub.publish(msg)
-        # publish display rendering (if it is a good time to do so)
-        if self._fragment_reminder.is_time():
-            self._renderer.update(distance_mm)
-            msg = self._renderer.as_msg()
-            self._display_pub.publish(msg)
-        '''
     def run(self):
-        # publish 10 messages every second (10 Hz)
-        rate = rospy.Rate(1)
-        while not rospy.is_shutdown():
-            message = Twist2DStamped(v = self._v, omega=self.omega)
-            self.message_time = rospy.get_time()
-            self._chassis_publisher.publish(message)
-            rate.sleep()
+        self.Map_state = "drive"
+        self.move(0.3, 3.14)
+        #make items
+        #self.MakeMap()
+        #self.PathFind_Callback()
 
-    def chassis_callback(self, chassis_msg):
-        self.last_call_back_time = rospy.get_time()
-        #current_time = float(chassis_msg.header.stamp.secs) + 10**(-9) * float(chassis_msg.header.stamp.nsecs)      
-        current_time = self.message_time   
-        print("Current time = %f" %(current_time))
-        if self.last_message_time != -1.0:
-            time_diff = current_time - self.last_message_time
-            self.compute_odometry(time_diff)
-
-        self.last_header = chassis_msg.header
-
-        self.last_linear_velocity = self.linear_velocity_factor * (chassis_msg.v)
-        print("Call back function sees speed %f" %(chassis_msg.v))
-        self.last_angular_velocity = self.angular_velocity_factor * (chassis_msg.omega)
-
-        self.last_message_time = current_time
-
-    
-    def compute_odometry(self, time_diff):
-        #self.chassis_msg.header = self.last_header
-
-        x = 0.0
-        y = 0.0
-        theta = 0.0
-
-        if (self.last_angular_velocity == 0.0):
-            x = time_diff * self.last_linear_velocity
-            print("Time diff = %f x = %f" %(time_diff, x))
-            y = 0.0
-            theta = 0.0
+    def callback_left(self, data):
+        # log general information once at the beginning
+        rospy.loginfo_once(f"Left encoder resolution: {data.resolution}")
+        rospy.loginfo_once(f"Left encoder type: {data.type}")
+        deltatime = rospy.get_time() - self.time
+        self.time = rospy.get_time()
+        
+        degrees = np.rad2deg(self.theta)
+        if self._ticks_left_counter == 0:
+            self._ticks_left_counter = data.data
+        
         else:
-            radius = self.last_linear_velocity / self.last_angular_velocity
-            theta = time_diff * self.last_angular_velocity
-            x = radius * np.sin(theta)
-            y = radius * (1 - np.cos(theta))
-        #Coordinates in duckiebot pose not world pose
-        #In order to get to world pose we need the last orientation theta and last pos.
-        #Think of best we to construct message for this
-        #Need x y and theta. can do calculations outside of message.
-        self.prev_x = self.x
-        self.prev_y = self.y
-        self.prev_theta = self.theta
+            self._ticks_left = data.data - self._ticks_left_counter
+            self.odometry_update()
+            self._ticks_left = 0
+            self._ticks_left_counter = data.data
 
-        self.theta = self.prev_theta + theta
-        self.x = x*np.cos(self.prev_theta) - y*np.sin(self.prev_theta) + self.prev_x        #rotate + shift to correct world pose
-        self.y = x*np.sin(self.prev_theta) + y*np.cos(self.prev_theta) + self.prev_y
-        print("Duckie is at postion x = %f y = %f theta = %f\n" %(self.x, self.y, self.theta))
-        self.counter = self.counter + 1
+            #if self.distance_traveled >= 0.5:
+            #    self.move(0,0)
+            if degrees >= 90:
+                self.move(0,0)
+                print("Degrees=%f" %(degrees))
+            print("Tick time =%f Distance Travelled = %f" %(deltatime, self.distance_traveled))
+            # store data 
+            print("Left encoder called")
+        
+        '''if self.last_encoder_message_left != data.data:
+                self._ticks_left += 1
+                self.last_encoder_message_left = data.data
+                
+                # Check if both left and right ticks have reached the threshold
+                if self._ticks_left >= self.tick_threshold and self._ticks_right >= self.tick_threshold:
+                    self.odometry_update()
+                    self._ticks_left = 0
+                    self._ticks_right = 0'''
+        
 
-        if (self.counter == 4):
-            self.move(0.5, 0)
-        if (self.counter == 5):
-            self.move(0, 0)
-        if (self.counter == 8):
-            self.move(0, 2*np.pi)
-        if (self.counter == 10):
-            self.move(0, 0)
+    def callback_right(self, data):
+        # log general information once at the beginning
+        rospy.loginfo_once(f"Right encoder resolution: {data.resolution}")
+        rospy.loginfo_once(f"Right encoder type: {data.type}")
+        
+        print("Right encoder ticks = %f" %(data.data))
+        degrees = np.rad2deg(self.theta)
+        if self._ticks_right_counter == 0:
+            self._ticks_right_counter = data.data
+        else:
+            self._ticks_right = data.data - self._ticks_right_counter
+            self.odometry_update()
+            self._ticks_right =0
+            self._ticks_right_counter = data.data
+            #if self.distance_traveled >= 0.5:
+            #    self.move(0,0)
+
+            if degrees >= 90:
+                self.move(0,0)
+                print("Degrees=%f" %(degrees))
+            # store data value
+        '''        if self.last_encoder_message_right != data.data:
+                self._ticks_right += 1
+                self.last_encoder_message_right = data.data
+                
+                # Check if both left and right ticks have reached the threshold
+                if self._ticks_left >= self.tick_threshold and self._ticks_right >= self.tick_threshold:
+                    self.odometry_update()
+                    self._ticks_left = 0
+                    self._ticks_right = 0 '''
+
+
+
+    def MakeMap(self):
+        Block1 = Object("Purple", 10, 2)
+        Block2 = Object("Pink", 50, 15)
+        self.Objects = [Block1, Block2]
+
+    def PathFind_Callback(self):
+        #read items plus locations
+        x1 =  self.Objects[0].x
+        y1 =  self.Objects[0].y
+
+        x2 = self.Objects[1].x
+        y2 = self.Objects[1].y
+        print("Found objects x1 = %f, y1 = %f, x2=%f, y2=%f" %(x1, y1, x2, y2))
+
+    def Map_Callback(self, ToF_msg):
+        #Need to wait until everything is initialized
+        degrees = np.rad2deg(self.theta)
+        print("Distance Travelled = %f" %(degrees))
+        if self.Map_state == "drive":
+            if ToF_msg.range <= self.ToF_distance or self.theta  >= np.pi:
+                self.move(0, 0)
+                print("Current position x= %f, y=%f, theta=%f" %(self.x, self.y, self.theta))
+                if self.lastrun == True:
+                    #mapping is done, start path planning
+                    #go to first object found
+                    self.Map_state = "path_planning"
+                else:
+                    self.Map_state = "done"
+
+            #Maybe not ideal this keeps calling odometry function?
+
+        elif self.Map_state == "turn_start":
+            self._turn_angle = self.theta + 90
+            #set initial turning angle. What happens if 350 + 90?
+            self.turning(self.theta, self._turn_angle)
+            self.Map_state = "turning"
+
+        elif self.Map_state == "turning":
+            self.turning(self.theta, self._turn_angle)
+            #check if cardboard wall is detected
+            if ToF_msg.range <= self.ToF_distance:
+                self.lastrun = True
+
+            #if detected, last run is starting  ->continue
+            #else continue
+            #turn 90 degrees
+            #Move straight
+
+        elif self.Map_state == "object_detected":
+            #approach object get distance from ToF sensor
+            #store location
+            x = 0  
+            y = 0       
+            type = "idkyetbruh"
+            NewObject = Object(type, x, y)
+            self.Objects.append(NewObject)
+        
+            #avoid object
+            #continue driving
+            self.move(0.5, 0)  #Move straight
+            self.Map_state="drive"
+
+    def odometry_update(self):
+        print("Ticks Left=%f Ticks Right=%f" %(self._ticks_left, self._ticks_right))
+        self.distance_left = self.distance_left + 2*np.pi*0.0318*(self._ticks_left)/135
+        self.distance_right = self.distance_right + 2*np.pi*0.0318*(self._ticks_right)/135
+        self.distance_traveled = ((self.distance_left + self.distance_right)/2)
+        #angle_turned = (self.distance_right - self.distance_left) / 0.1
+        #print("Left = %f, Right %f called by %f" %(self.distance_left, self.distance_right, self.calledby))
+        angle_turned = (2*np.pi*0.0318*(self._ticks_right)/135 - 2*np.pi*0.0318*(self._ticks_left)/135)/0.1
+        self.x = self.x + self.distance_traveled*np.cos(self.theta)
+        self.y = self.y + self.distance_traveled*np.sin(self.theta)
+        self.theta = self.theta + angle_turned
+        printer = np.rad2deg(self.theta)
+        print("Theta=%f" %(printer))
+        
 
     def on_shutdown(self):
         stop = Twist2DStamped(v=0.0, omega=0.0)
         self._chassis_publisher.publish(stop)
 
     def move(self, v, omega):
-        self._v = self.speed_factor * v
+        self._v = v
         self.omega = omega
+        message = Twist2DStamped(v = self._v, omega=self.omega)
+        self._chassis_publisher.publish(message)
         print("Speed has been set to  v = %f" %(v))
+    
+    def turning(self,angle_turned,angle_aimed):
+        if angle_turned < angle_aimed:
+            message = Twist2DStamped(v=0.3,omega=0.5)
+            self._chassis_publisher.publish(message)
+            print("Turning; Angle aimed=%f, current theta=%f" %(self._turn_angle,self.theta))
+            return 
+        else:
+            message = Twist2DStamped(v=0.0,omega=0.0)
+            self._chassis_publisher.publish(message)
+            print("Done Turning; Angle aimed=%f, current theta=%f" %(self._turn_angle,self.theta))
+            self.Map_state = ""
     
 if __name__ == '__main__':
     # create the node
     node = MappingNode(node_name='mapping_node')
-    # run node, start movement
     node.run()
+    # run node, start movement
 
     # keep the process from terminating
     rospy.spin()
