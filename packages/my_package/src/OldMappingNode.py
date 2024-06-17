@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from typing import Tuple
-import math
 import numpy as np
 import os, rospy, yaml, dataclasses, time
 from typing import Optional
@@ -38,23 +37,21 @@ class MappingNode(DTROS):
         self._ticks_right_counter =0
         self._ticks_left = 0
         self._ticks_right = 0
-  
+        self.tick_threshold = 15
         self.time = 0
         #initialise variables
         self.x = 0
         self.y = 0
         self.Objects = 0
-        self.points = []
-
+        self.last_encoder_message_left = 0
+        self.last_encoder_message_right = 0
+        self.calledby = 0
         self._turn_angle = 0
         self.distance_traveled = 0.0
-        self.actual_distance_traveled =0
+        self.prev_distance = 0
         self.distance_left = 0
         self.distance_right = 0
         self.theta = 0 #starts off driving towards y direction
-        self.mapnotmade =0
-        self.distance_to_drive =0
-        self.angle_to_turn =0
 
         self.Map_state = "Initializing"
         self.lastrun = False
@@ -63,18 +60,25 @@ class MappingNode(DTROS):
         #self._odometry_publisher = rospy.Publisher(self.odometry_topic, TransformStamped, queue_size=1)
         #subscriber
         #self._chassis_subscriber = rospy.Subscriber(twist_topic,Twist2DStamped, self.chassis_callback)
-        self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Brain)
+        #self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Map_Callback)
         self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left)
         self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right)
 
     def run(self):
-        self.Map_state = "Determine target"
+        self.Map_state = "drive"
+        self.move(0.3, 3.14)
+        #make items
+        #self.MakeMap()
+        #self.PathFind_Callback()
 
     def callback_left(self, data):
         # log general information once at the beginning
         rospy.loginfo_once(f"Left encoder resolution: {data.resolution}")
         rospy.loginfo_once(f"Left encoder type: {data.type}")
-
+        deltatime = rospy.get_time() - self.time
+        self.time = rospy.get_time()
+        
+        degrees = np.rad2deg(self.theta)
         if self._ticks_left_counter == 0:
             self._ticks_left_counter = data.data
         
@@ -83,12 +87,34 @@ class MappingNode(DTROS):
             self.odometry_update()
             self._ticks_left = 0
             self._ticks_left_counter = data.data
-            
+
+            #if self.distance_traveled >= 0.5:
+            #    self.move(0,0)
+            if degrees >= 90:
+                self.move(0,0)
+                print("Degrees=%f" %(degrees))
+            print("Tick time =%f Distance Travelled = %f" %(deltatime, self.distance_traveled))
+            # store data 
+            print("Left encoder called")
+        
+        '''if self.last_encoder_message_left != data.data:
+                self._ticks_left += 1
+                self.last_encoder_message_left = data.data
+                
+                # Check if both left and right ticks have reached the threshold
+                if self._ticks_left >= self.tick_threshold and self._ticks_right >= self.tick_threshold:
+                    self.odometry_update()
+                    self._ticks_left = 0
+                    self._ticks_right = 0'''
+        
+
     def callback_right(self, data):
         # log general information once at the beginning
         rospy.loginfo_once(f"Right encoder resolution: {data.resolution}")
         rospy.loginfo_once(f"Right encoder type: {data.type}")
-
+        
+        print("Right encoder ticks = %f" %(data.data))
+        degrees = np.rad2deg(self.theta)
         if self._ticks_right_counter == 0:
             self._ticks_right_counter = data.data
         else:
@@ -96,54 +122,38 @@ class MappingNode(DTROS):
             self.odometry_update()
             self._ticks_right =0
             self._ticks_right_counter = data.data
-            
+            #if self.distance_traveled >= 0.5:
+            #    self.move(0,0)
+
+            if degrees >= 90:
+                self.move(0,0)
+                print("Degrees=%f" %(degrees))
+            # store data value
+        '''        if self.last_encoder_message_right != data.data:
+                self._ticks_right += 1
+                self.last_encoder_message_right = data.data
+                
+                # Check if both left and right ticks have reached the threshold
+                if self._ticks_left >= self.tick_threshold and self._ticks_right >= self.tick_threshold:
+                    self.odometry_update()
+                    self._ticks_left = 0
+                    self._ticks_right = 0 '''
+
+
+
     def MakeMap(self):
         Block1 = Object("Purple", 10, 2)
-        Block2 = Object("Pink", 1.1, 0)
-        Block3 = Object("Green",0.5,0.5)
-        Block4 = Object("Green",10,1)
-        Objects = [Block1, Block2, Block3, Block4]
-        return Objects
-    
-    def Brain(self, ToF_msg):
-        if self.Map_state == "Determine target":
-            if self.mapnotmade == 0:
-                self.Objects = self.MakeMap()
-                self.mapnotmade =1
-                for i in range(len(self.Objects)):
-                    self.points.append([self.Objects[i].x,self.Objects[i].y])
-            
-            drivetopoint = self.find_path(self.points)
-            self.points.pop(self.points.index(drivetopoint))
-            print("Closest point is %f, %f" %(drivetopoint[0],drivetopoint[1]))
-            self.distance_to_drive = self.find_distance(drivetopoint)
-            self.angle_to_turn = self.find_angle(drivetopoint)
-            print("Driving distance %f and angle %f" %(self.distance_to_drive,self.angle_to_turn))
+        Block2 = Object("Pink", 50, 15)
+        self.Objects = [Block1, Block2]
 
-            #jurre his pathfinding function
-            #ordered list of points
-            #directions to get there
-            self.move(0.3,np.pi)
-            self.Map_state = "turn"
+    def PathFind_Callback(self):
+        #read items plus locations
+        x1 =  self.Objects[0].x
+        y1 =  self.Objects[0].y
 
-        elif self.Map_state == "drive":
-            print("x= %f y= %f" %(self.x, self.y))
-            if ToF_msg.range <= self.ToF_distance:
-                #do daniels stuff
-                dummy = 1
-            elif(self.drive_distance(self.distance_to_drive)==1):
-                self.move(0,0)
-                self.Map_state = "Determine target"
-
-        elif self.Map_state == "turn":
-            if ToF_msg.range <= self.ToF_distance:
-                dummy =1
-            elif(self.turning(self.angle_to_turn)):
-                self.move(0.3, 0)
-                self.actual_distance_traveled =0
-                self.Map_state = "drive"
-                #needs to look for object now? dont think       
-                
+        x2 = self.Objects[1].x
+        y2 = self.Objects[1].y
+        print("Found objects x1 = %f, y1 = %f, x2=%f, y2=%f" %(x1, y1, x2, y2))
 
     def Map_Callback(self, ToF_msg):
         #Need to wait until everything is initialized
@@ -194,21 +204,16 @@ class MappingNode(DTROS):
             self.Map_state="drive"
 
     def odometry_update(self):
-        #print("Ticks Left=%f Ticks Right=%f" %(self._ticks_left, self._ticks_right))
-        self.distance_left = 2*np.pi*0.0318*(self._ticks_left)/135
-        self.distance_right = 2*np.pi*0.0318*(self._ticks_right)/135
+        print("Ticks Left=%f Ticks Right=%f" %(self._ticks_left, self._ticks_right))
+        self.distance_left = self.distance_left + 2*np.pi*0.0318*(self._ticks_left)/135
+        self.distance_right = self.distance_right + 2*np.pi*0.0318*(self._ticks_right)/135
         self.distance_traveled = ((self.distance_left + self.distance_right)/2)
-        
-        self.actual_distance_traveled = self.actual_distance_traveled + self.distance_traveled
-
+        #angle_turned = (self.distance_right - self.distance_left) / 0.1
+        #print("Left = %f, Right %f called by %f" %(self.distance_left, self.distance_right, self.calledby))
         angle_turned = (2*np.pi*0.0318*(self._ticks_right)/135 - 2*np.pi*0.0318*(self._ticks_left)/135)/0.1
         self.x = self.x + self.distance_traveled*np.cos(self.theta)
         self.y = self.y + self.distance_traveled*np.sin(self.theta)
-
-        if (self.theta + angle_turned) > np.pi*2:
-            self.theta = (self.theta+angle_turned)%(np.pi*2)
-        else:
-            self.theta = self.theta + angle_turned
+        self.theta = self.theta + angle_turned
         printer = np.rad2deg(self.theta)
         print("Theta=%f" %(printer))
         
@@ -224,40 +229,17 @@ class MappingNode(DTROS):
         self._chassis_publisher.publish(message)
         print("Speed has been set to  v = %f" %(v))
     
-    def turning(self, angle_aimed):         #while turning its still moving forward take this into account
-        degrees = np.rad2deg(self.theta)
-        if degrees >= angle_aimed:
-            self.move(0,0)
-            print("Degrees=%f" %(degrees))
-            return 1
+    def turning(self,angle_turned,angle_aimed):
+        if angle_turned < angle_aimed:
+            message = Twist2DStamped(v=0.3,omega=0.5)
+            self._chassis_publisher.publish(message)
+            print("Turning; Angle aimed=%f, current theta=%f" %(self._turn_angle,self.theta))
+            return 
         else:
-            return 0   
-
-    def drive_distance(self, distance):
-        if self.actual_distance_traveled>= distance:
-            self.move(0,0)
-            return 1
-        else:
-            return 0
-    def find_distance(self,ending_loc):
-        distance = math.sqrt((ending_loc[0]-self.x)**2+(ending_loc[1]-self.y)**2)
-        return distance
-
-    def find_angle(self,ending_loc):
-        angle = math.atan2((ending_loc[1]-self.x),ending_loc[0]-self.y)
-        angle = math.degrees(angle)
-        return angle
-
-    def find_path(self, points):
-        distances = []
-        # starting_point = [self.x,self.y]
-        for i in range(len(points)):
-            distances.append(self.find_distance(points[i]))
-            # print(str(distances))
-            # print(distances.index(min(distances)))
-        closest = points[distances.index(min(distances))]
-        return closest
-
+            message = Twist2DStamped(v=0.0,omega=0.0)
+            self._chassis_publisher.publish(message)
+            print("Done Turning; Angle aimed=%f, current theta=%f" %(self._turn_angle,self.theta))
+            self.Map_state = ""
     
 if __name__ == '__main__':
     # create the node
