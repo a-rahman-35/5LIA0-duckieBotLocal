@@ -24,7 +24,7 @@ class MappingNode(DTROS):
         # initialize the DTROS parent class
         super(MappingNode, self).__init__(node_name=node_name, node_type=NodeType.MAPPING)
         # static parameters
-        self.ToF_distance=  0.2 #in meters
+        self.ToF_distance=  0.4 #in meters
 
         self.vehicle_name = os.environ['VEHICLE_NAME']
         twist_topic = f"/{self.vehicle_name}/car_cmd_switch_node/cmd"
@@ -46,6 +46,13 @@ class MappingNode(DTROS):
         self.Objects = 0
         self.points = []
 
+        self.i = 0
+        self.Kp = 0.3  # Proportional gain
+        self.Ki = 0.05  # Integral gain
+        self.Kd = 0.1  # Derivative gain
+        self.integral_error = 0.0
+        self.prev_error = 0.0
+
         self._turn_angle = 0
         self.distance_traveled = 0.0
         self.actual_distance_traveled =0
@@ -55,9 +62,11 @@ class MappingNode(DTROS):
         self.mapnotmade =0
         self.distance_to_drive =0
         self.angle_to_turn =0
-
+        self.turn_direction = "right"
         self.Map_state = "Initializing"
         self.lastrun = False
+        self.movement_state = "init"
+
         # construct chassis control publisher
         self._chassis_publisher = rospy.Publisher(twist_topic, Twist2DStamped, queue_size=1) #message needs to be timestamped
         #self._odometry_publisher = rospy.Publisher(self.odometry_topic, TransformStamped, queue_size=1)
@@ -100,7 +109,7 @@ class MappingNode(DTROS):
     def MakeMap(self):
         Block1 = Object("Purple", 10, 2)
         Block2 = Object("Pink", 1.1, 0)
-        Block3 = Object("Green",0.5,0.5)
+        Block3 = Object("Green",1,0)
         Block4 = Object("Green",10,1)
         Objects = [Block1, Block2, Block3, Block4]
         return Objects
@@ -129,21 +138,54 @@ class MappingNode(DTROS):
         elif self.Map_state == "drive":
             print("x= %f y= %f" %(self.x, self.y))
             if ToF_msg.range <= self.ToF_distance:
-                #do daniels stuff
-                dummy = 1
+                print("Current position x= %f, y=%f, theta=%f" %(self.x, self.y, self.theta))
+                self.Map_state = "avoid_obstacle"
+                self.original_theta = self.theta
             elif(self.drive_distance(self.distance_to_drive)==1):
                 self.move(0,0)
-                self.Map_state = "Determine target"
+                self.Map_state = "Done"
+            else:
+                if self.movement_state != "driving":
+                    self.move(0.3, 0)
+                    self.movement_state = "driving"
+                
+                elif (self.i % 2 == 0):
+                    error = self.original_theta - self.theta
+                    self.integral_error += error
+                    derivative_error = error - self.prev_error
+
+                    control_effort = self.Kp * error + self.Ki * self.integral_error + self.Kd * derivative_error
+                    self.prev_error = error
+                    print("debug: error= %f original theta = %f current theta %f \n" %(error,self.original_theta, self.theta))
+                    self.move(0.3, control_effort)
+                
+                self.i + 1
 
         elif self.Map_state == "turn":
             if ToF_msg.range <= self.ToF_distance:
                 dummy =1
+                #lets assume turn will be made quick no enough so not needed
             elif(self.turning(self.angle_to_turn)):
                 self.move(0.3, 0)
                 self.actual_distance_traveled =0
                 self.Map_state = "drive"
                 #needs to look for object now? dont think       
-                
+        elif self.Map_state == "avoid_obstacle":
+            #approach object get distance from ToF sensor
+            #store location
+            self.smooth_turning(ToF_msg.range)
+            if ToF_msg.range > self.ToF_distance:
+                self.Map_state = "return_to_path"
+
+        elif self.Map_state == "return_to_path":
+            self.return_to_path()
+            print("original theta = %f current theta %f \n" %(self.original_theta, self.theta))
+            if ToF_msg.range < self.ToF_distance:
+                self.Map_state = "avoid_obstacle"
+            elif abs(self.original_theta - self.theta) < 0.1:  # Adjust the threshold as necessary
+                #$self.Map_state = "drive"
+                print("stop\n")
+                self.move(0, 0)
 
     def Map_Callback(self, ToF_msg):
         #Need to wait until everything is initialized
@@ -257,6 +299,55 @@ class MappingNode(DTROS):
             # print(distances.index(min(distances)))
         closest = points[distances.index(min(distances))]
         return closest
+    
+    def smooth_turning(self, distance):
+        TURN_FACTOR = 5
+        BASE_SPEED = 0.3
+        SAFE_DISTANCE = 0.4  # meters
+        MIN_SPEED = 0.1
+        MAX_SPEED = 0.3
+        CLOSEST_DISTANCE = 0.3 
+
+        # Proportional control to determine turning angle
+        error = (0.1+SAFE_DISTANCE) - distance
+        turn_rate = 0.5 + TURN_FACTOR * error / SAFE_DISTANCE
+
+        if distance < CLOSEST_DISTANCE:
+            speed = MIN_SPEED
+        elif distance > SAFE_DISTANCE:
+            speed = MAX_SPEED
+        else:
+            speed = MIN_SPEED + (MAX_SPEED - MIN_SPEED) * (1 - (error / (SAFE_DISTANCE - CLOSEST_DISTANCE)))
+
+        # Ensure the speed is within the desired range
+        speed = max(MIN_SPEED, min(MAX_SPEED, speed))
+	
+	
+        # Ensure the turn rate is within a reasonable range
+        turn_rate = max(min(turn_rate, np.pi), -np.pi)
+
+        if self.turn_direction == 'left':
+            omega = turn_rate
+        else:
+            omega = -turn_rate
+        
+        print("Omega = %f \n" %(omega))
+
+        self.move(speed, omega)
+
+    def return_to_path(self):
+        current_heading = self.theta  # Assuming theta is updated by odometry_update
+        heading_error = self.original_theta - current_heading
+
+        if abs(heading_error) > 0.1:  # Adjust the threshold as necessary
+            if heading_error > 0:
+                self.move(0.3, np.pi/2)  # Adjust omega for turning left while moving forward
+            else:
+                self.move(0.3, -np.pi/2)  # Adjust omega for turning right while moving forward
+        else:
+            self.move(0.0, 0)  # Move forward once aligned
+
+
 
     
 if __name__ == '__main__':
