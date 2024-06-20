@@ -47,12 +47,12 @@ class MappingNode(DTROS):
         self.points = []
 
         self.i = 0
-        self.Kp = 0.3  # Proportional gain
-        self.Ki = 0.05  # Integral gain
-        self.Kd = 0.1  # Derivative gain
+        self.Kp = 2  # Proportional gain
+        self.Ki = 0.15  # Integral gain
+        self.Kd = 0.3 # Derivative gain
         self.integral_error = 0.0
         self.prev_error = 0.0
-
+        self.checkifclear=0
         self._turn_angle = 0
         self.distance_traveled = 0.0
         self.actual_distance_traveled =0
@@ -65,19 +65,22 @@ class MappingNode(DTROS):
         self.turn_direction = "right"
         self.Map_state = "Initializing"
         self.lastrun = False
+        self.turn_state = "init"
         self.movement_state = "init"
-
+        self.original_theta =0
+        self.returning = 0
+        self.drivetopoint = []
         # construct chassis control publisher
         self._chassis_publisher = rospy.Publisher(twist_topic, Twist2DStamped, queue_size=1) #message needs to be timestamped
         #self._odometry_publisher = rospy.Publisher(self.odometry_topic, TransformStamped, queue_size=1)
         #subscriber
         #self._chassis_subscriber = rospy.Subscriber(twist_topic,Twist2DStamped, self.chassis_callback)
         self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Brain)
-        self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left)
-        self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right)
+        self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left, queue_size=1)
+        self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right, queue_size=1)
 
     def run(self):
-        self.Map_state = "Determine target"
+        self.Map_state = "determine"
 
     def callback_left(self, data):
         # log general information once at the beginning
@@ -107,9 +110,9 @@ class MappingNode(DTROS):
             self._ticks_right_counter = data.data
             
     def MakeMap(self):
-        Block1 = Object("Purple", 10, 2)
-        Block2 = Object("Pink", 1.1, 0)
-        Block3 = Object("Green",1,0)
+        Block1 = Object("Purple", 10, 1.2)
+        Block2 = Object("Pink", 10.0, 8)
+        Block3 = Object("Green",0.8,0)
         Block4 = Object("Green",10,1)
         Objects = [Block1, Block2, Block3, Block4]
         return Objects
@@ -122,30 +125,37 @@ class MappingNode(DTROS):
                 for i in range(len(self.Objects)):
                     self.points.append([self.Objects[i].x,self.Objects[i].y])
             
-            drivetopoint = self.find_path(self.points)
-            self.points.pop(self.points.index(drivetopoint))
-            print("Closest point is %f, %f" %(drivetopoint[0],drivetopoint[1]))
-            self.distance_to_drive = self.find_distance(drivetopoint)
-            self.angle_to_turn = self.find_angle(drivetopoint)
+            self.drivetopoint = self.find_path(self.points)
+            self.points.pop(self.points.index(self.drivetopoint))
+            print("Closest point is %f, %f" %(self.drivetopoint[0],self.drivetopoint[1]))
+            self.distance_to_drive = self.find_distance(self.drivetopoint)
+            self.angle_to_turn = self.find_angle(self.drivetopoint)
             print("Driving distance %f and angle %f" %(self.distance_to_drive,self.angle_to_turn))
 
             #jurre his pathfinding function
             #ordered list of points
             #directions to get there
-            self.move(0.3,np.pi)
             self.Map_state = "turn"
 
         elif self.Map_state == "drive":
             print("x= %f y= %f" %(self.x, self.y))
             if ToF_msg.range <= self.ToF_distance:
+                self.move(0,0)
                 print("Current position x= %f, y=%f, theta=%f" %(self.x, self.y, self.theta))
+                self.movement_state = "not driving"
                 self.Map_state = "avoid_obstacle"
                 self.original_theta = self.theta
             elif(self.drive_distance(self.distance_to_drive)==1):
                 self.move(0,0)
-                self.Map_state = "Done"
+                self.movement_state = "not driving"
+                if self.returning == 0:
+                    print("Duckiebot is returning")
+                    self.Map_state = "done"
+                else:
+                    self.Map_state = "done"
             else:
-                if self.movement_state != "driving":
+                #print("Distance to drive=%f" %(self.distance_to_drive-self.actual_distance_traveled))
+                if self.movement_state != "driving":  
                     self.move(0.3, 0)
                     self.movement_state = "driving"
                 
@@ -160,16 +170,38 @@ class MappingNode(DTROS):
                     self.move(0.3, control_effort)
                 
                 self.i + 1
+        elif self.Map_state == "Return":
+            self.move(-0.3, 0)
+            time.sleep(1)
+            self.distance_to_drive = self.find_distance([0,0])
+            self.angle_to_turn = self.find_angle([0,0])
+            print("Found home base, driving distance %f and angle %f" %(self.distance_to_drive,self.angle_to_turn))
+            self.returning = 1
+            self.Map_state = "turn"
 
         elif self.Map_state == "turn":
+            if ToF_msg.range <= self.ToF_distance:
+                print("Current position x= %f, y=%f, theta=%f" %(self.x, self.y, self.theta))
+                self.move(0,0)
+                self.turn_state = "not turning"
+                self.Map_state = "avoid_obstacle"
+                self.original_theta = self.theta
+
+            if(self.turn_state != "turning"):
+                self.move(0.2, 1.25*np.pi)
+                self.turn_state = "turning"
+                #needs to look for object now? dont think   
             if ToF_msg.range <= self.ToF_distance:
                 dummy =1
                 #lets assume turn will be made quick no enough so not needed
             elif(self.turning(self.angle_to_turn)):
-                self.move(0.3, 0)
+                print("Entered angle check")
                 self.actual_distance_traveled =0
+                self.original_theta = self.theta
+                self.distance_to_drive = self.find_distance(self.drivetopoint)
                 self.Map_state = "drive"
-                #needs to look for object now? dont think       
+                self.turn_state = "not turning"
+    
         elif self.Map_state == "avoid_obstacle":
             #approach object get distance from ToF sensor
             #store location
@@ -177,13 +209,21 @@ class MappingNode(DTROS):
             if ToF_msg.range > self.ToF_distance:
                 self.Map_state = "return_to_path"
 
+        elif self.Map_state == "back to original point":
+
+            self.distance_to_drive = self.find_distance(self.drivetopoint)
+            self.angle_to_turn = self.find_angle(self.drivetopoint)
+            self.Map_state = "turn"
+            print("Driving distance %f and angle %f" %(self.distance_to_drive,self.angle_to_turn))
+
+
         elif self.Map_state == "return_to_path":
             self.return_to_path()
             print("original theta = %f current theta %f \n" %(self.original_theta, self.theta))
             if ToF_msg.range < self.ToF_distance:
                 self.Map_state = "avoid_obstacle"
             elif abs(self.original_theta - self.theta) < 0.1:  # Adjust the threshold as necessary
-                #$self.Map_state = "drive"
+                self.Map_state = "back to original point"
                 print("stop\n")
                 self.move(0, 0)
 
@@ -268,7 +308,7 @@ class MappingNode(DTROS):
     
     def turning(self, angle_aimed):         #while turning its still moving forward take this into account
         degrees = np.rad2deg(self.theta)
-        if degrees >= angle_aimed:
+        if degrees >= angle_aimed - 0.0872: #and degrees <= angle_aimed+ 2*0.0872:
             self.move(0,0)
             print("Degrees=%f" %(degrees))
             return 1
@@ -287,7 +327,12 @@ class MappingNode(DTROS):
 
     def find_angle(self,ending_loc):
         angle = math.atan2((ending_loc[1]-self.x),ending_loc[0]-self.y)
+        print("dy=%f dx = %f" %((ending_loc[1]-self.x), ending_loc[0]-self.y))
+        print("Angle = %f" %(np.rad2deg(angle)))
         angle = math.degrees(angle)
+        if angle < 0:
+            angle = 2*np.pi + angle
+        print("Sees Angle %f" %(angle))
         return angle
 
     def find_path(self, points):
@@ -306,7 +351,7 @@ class MappingNode(DTROS):
         SAFE_DISTANCE = 0.4  # meters
         MIN_SPEED = 0.1
         MAX_SPEED = 0.3
-        CLOSEST_DISTANCE = 0.3 
+        CLOSEST_DISTANCE = 0.3
 
         # Proportional control to determine turning angle
         error = (0.1+SAFE_DISTANCE) - distance
@@ -324,7 +369,7 @@ class MappingNode(DTROS):
 	
 	
         # Ensure the turn rate is within a reasonable range
-        turn_rate = max(min(turn_rate, np.pi), -np.pi)
+        turn_rate = max(min(turn_rate, (np.pi)), -(np.pi))
 
         if self.turn_direction == 'left':
             omega = turn_rate
@@ -354,6 +399,7 @@ if __name__ == '__main__':
     # create the node
     node = MappingNode(node_name='mapping_node')
     node.run()
+    #node.on_shutdown()
     # run node, start movement
 
     # keep the process from terminating
