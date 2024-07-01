@@ -7,6 +7,7 @@ from typing import Optional
 from dt_robot_utils import get_robot_name
 from duckietown.dtros import DTROS, NodeType, TopicType
 from duckietown_msgs.msg import Twist2DStamped, WheelEncoderStamped
+from geometry_msgs.msg import Point
 from sensor_msgs.msg import Range
 from std_msgs.msg import Header
 SENSOR_NAME: str = "front_center"
@@ -75,12 +76,21 @@ class MappingNode(DTROS):
         #self._odometry_publisher = rospy.Publisher(self.odometry_topic, TransformStamped, queue_size=1)
         #subscriber
         #self._chassis_subscriber = rospy.Subscriber(twist_topic,Twist2DStamped, self.chassis_callback)
-        self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Brain)
-        self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left, queue_size=1)
-        self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right, queue_size=1)
+        #self._tof_subscriber = rospy.Subscriber(f"/{self.vehicle_name}/{SENSOR_NAME}_tof_driver_node/range", Range, self.Brain)
+        self.odometry_node = rospy.Subscriber("odometry", Point, self.callback_odometry, queue_size=1)
+        #self.wheelencoder_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left, queue_size=1)
+        #self.wheelencoder_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right, queue_size=1)
 
     def run(self):
-        self.Map_state = "determine"
+        self.Map_state = ""
+
+    def callback_odometry(self, data):
+        print("received left tick %f and right ticks %f" %(data.x, data.y))
+        self._ticks_left = data.x
+        self._ticks_right = data.y
+        self.odometry_update()
+        self._ticks_left =0
+        self._right_right=0
 
     def callback_left(self, data):
         # log general information once at the beginning
